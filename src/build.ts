@@ -46,6 +46,13 @@ const GlobalImportAliases: Record<string, string> = {
 		'valenced.externals.ReactNavigation.ReactNavigationNative',
 }
 
+const PhoenixImportAliases: Record<string, string> = {
+	'@valenced/phoenix': 'valenced.phoenix',
+	'@valenced/phoenix/gateway': 'valenced.phoenix',
+	'@valenced/phoenix/ui': 'valenced.phoenix.ui',
+	'@valenced/phoenix/bytes': 'valenced.phoenix.bytes',
+}
+
 const ImportMap = {
 	...publicImportMap,
 	...hiddenImportMap,
@@ -58,13 +65,26 @@ const TypeOnlyModules = new Set(
 )
 
 function isExternal(id: string): boolean {
-	if (id in GlobalImportAliases) return true
+	if (id in GlobalImportAliases || id in PhoenixImportAliases) return true
 
 	return id in ImportMap || TypeOnlyModules.has(id)
 }
 
 /** Resolves a module to the global path. Returns `null` for a type-only module. */
-function resolveExternal(id: string): ExternalTarget | null {
+function resolveExternal(id: string, phoenix = false): ExternalTarget | null {
+	if (id in PhoenixImportAliases) {
+		if (!phoenix)
+			throw new Error(
+				`${id} is only available in a Phoenix bundle (phoenix.{ts,js}).`,
+			)
+		return { global: PhoenixImportAliases[id]!, interop: 'namespace' }
+	}
+
+	if (phoenix && !TypeOnlyModules.has(id))
+		throw new Error(
+			`${id} is not available in Phoenix. A Phoenix bundle can only import @valenced/phoenix modules.`,
+		)
+
 	if (id in GlobalImportAliases) {
 		return { global: GlobalImportAliases[id]!, interop: 'cjs' }
 	}
@@ -313,6 +333,7 @@ function extractImportedSymbols(
 	ast: Module,
 	edits: TextEdit[],
 	_buf: Buffer,
+	phoenix: boolean,
 ): {
 	symbolMap: Map<string, string>
 	addEdit: (start: number, end: number, replacement: string) => void
@@ -332,7 +353,7 @@ function extractImportedSymbols(
 		)
 		if (valueSpecifiers.length === 0) continue
 
-		const target = resolveExternal(source)
+		const target = resolveExternal(source, phoenix)
 		if (!target) continue
 
 		for (const spec of valueSpecifiers) {
@@ -560,7 +581,11 @@ function applyEditsToBuffer(code: string, edits: TextEdit[]): string {
  * Rewrites one module: external imports are erased and every use of an imported symbol becomes a property access on `valenced`.
  * Returns `null` when the module imports nothing external.
  */
-export function inlineExternalImports(code: string, id: string): string | null {
+export function inlineExternalImports(
+	code: string,
+	id: string,
+	phoenix = false,
+): string | null {
 	if (!/\.[jt]sx?$/.test(id) || id.includes('node_modules')) return null
 
 	const isTs = id.endsWith('.ts') || id.endsWith('.tsx')
@@ -579,7 +604,12 @@ export function inlineExternalImports(code: string, id: string): string | null {
 
 	const edits: TextEdit[] = []
 	const buf = Buffer.from(code, 'utf8')
-	const { symbolMap, addEdit } = extractImportedSymbols(ast, edits, buf)
+	const { symbolMap, addEdit } = extractImportedSymbols(
+		ast,
+		edits,
+		buf,
+		phoenix,
+	)
 	if (symbolMap.size === 0) return null
 
 	collectIdentifierEdits(ast, symbolMap, addEdit)
@@ -594,17 +624,19 @@ export function inlineExternalImports(code: string, id: string): string | null {
  *
  * This avoids any top-level variable binding or preInit property evaluation issues.
  */
-const inlineImportsPlugin = {
-	name: 'inline-imports',
-	transform(code: string, id: string) {
-		const transformed = inlineExternalImports(code, id)
-		if (transformed === null) return null
+function inlineImportsPlugin(phoenix: boolean) {
+	return {
+		name: 'inline-imports',
+		transform(code: string, id: string) {
+			const transformed = inlineExternalImports(code, id, phoenix)
+			if (transformed === null) return null
 
-		return {
-			code: transformed,
-			map: null,
-		}
-	},
+			return {
+				code: transformed,
+				map: null,
+			}
+		},
+	}
 }
 
 const ENTRY_CANDIDATES = [
@@ -620,6 +652,15 @@ const ENTRY_CANDIDATES = [
 	'index.tsx',
 	'index.js',
 	'index.jsx',
+]
+
+const PHOENIX_ENTRY_CANDIDATES = [
+	'js/phoenix.ts',
+	'js/phoenix.js',
+	'src/phoenix.ts',
+	'src/phoenix.js',
+	'phoenix.ts',
+	'phoenix.js',
 ]
 
 function cleanupBundleCode(code: string): string {
@@ -702,8 +743,10 @@ export async function run(argv: string[]): Promise<void> {
 		console.log(`Usage: valenced-plugin build [names...] [--dev] [--plugins-dir <dir>]...
 
 Bundles each plugin's index.{ts,tsx,js,jsx} (in the plugin root or js/) into
-<plugin>/build/js/index.js. Positional names select specific plugins; otherwise
-every plugin is built. Repeat --plugins-dir to build from several directories.`)
+<plugin>/build/js/index.js, and its phoenix.{ts,js} into
+<plugin>/build/phoenix/index.js when dist.phoenix is set. Positional names
+select specific plugins; otherwise every plugin is built. Repeat --plugins-dir
+to build from several directories.`)
 		return
 	}
 
@@ -719,99 +762,112 @@ every plugin is built. Repeat --plugins-dir to build from several directories.`)
 		if (!existsSync(manifestPath)) continue
 
 		const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-		const script: string | undefined = manifest.dist?.script
-		if (!script) continue // No JS portion.
+		for (const phoenix of [false, true]) {
+			const script: string | undefined = phoenix
+				? manifest.dist?.phoenix
+				: manifest.dist?.script
+			if (!script) continue // No JS portion.
 
-		const entry = ENTRY_CANDIDATES.map(c => `${dir}/${c}`).find(existsSync)
-		if (!entry) {
-			console.warn(
-				`! ${name}: dist.script is set but no index.{ts,tsx,js,jsx} found; skipping JS`,
-			)
-			continue
-		}
-
-		try {
-			const bundle = await rolldown({
-				input: entry,
-				platform: 'neutral',
-				external: isExternal,
-				plugins: [fileParserPlugin, inlineImportsPlugin, hermesSwcPlugin],
-				resolve: {
-					mainFields: ['module', 'main'],
-					extensions: [
-						'.tsx',
-						'.ts',
-						'.jsx',
-						'.js',
-						'.mjs',
-						'.cjs',
-						'.json',
-						'.png',
-						'.jpg',
-						'.jpeg',
-						'.webp',
-						'.svg',
-					],
-				},
-				transform: {
-					target: 'es2020',
-					jsx: {
-						// Compiles to `react/jsx-runtime` imports, which remaps to `valenced.react.ReactJSXRuntime`.
-						runtime: 'automatic',
-						// We don't expose jsxDev
-						development: false,
-					},
-					define: {
-						__DEV__: String(dev),
-						IS_DEV: String(dev),
-					},
-				},
-				onwarn(warning, warn) {
-					if (warning.code === 'MISSING_NAME_OPTION_FOR_IIFE_EXPORT') return
-					if (warning.code === 'MIXED_EXPORTS') return
-					// Plugins set `jsx: "preserve"` so TSC only typechecks and the bundler transforms.
-					// Setting it here (rather than inheriting tsconfig) keeps outputs deterministic, so the "overridden" notice is expected.
-					if (
-						warning.code === 'CONFIGURATION_FIELD_CONFLICT' &&
-						warning.message.includes('jsx')
+			// A file at the dist.phoenix path is a prebuilt bundle.
+			const entry = (phoenix ? PHOENIX_ENTRY_CANDIDATES : ENTRY_CANDIDATES)
+				.map(c => `${dir}/${c}`)
+				.find(c => existsSync(c) && !(phoenix && c === `${dir}/${script}`))
+			if (!entry) {
+				if (!phoenix)
+					console.warn(
+						`! ${name}: dist.script is set but no index.{ts,tsx,js,jsx} found; skipping JS`,
 					)
-						return
+				continue
+			}
 
-					warn(warning)
-				},
-			})
+			const kind = phoenix ? 'Phoenix' : 'JS'
+			try {
+				const bundle = await rolldown({
+					input: entry,
+					platform: 'neutral',
+					external: isExternal,
+					plugins: [
+						fileParserPlugin,
+						inlineImportsPlugin(phoenix),
+						hermesSwcPlugin,
+					],
+					resolve: {
+						mainFields: ['module', 'main'],
+						extensions: [
+							'.tsx',
+							'.ts',
+							'.jsx',
+							'.js',
+							'.mjs',
+							'.cjs',
+							'.json',
+							'.png',
+							'.jpg',
+							'.jpeg',
+							'.webp',
+							'.svg',
+						],
+					},
+					transform: {
+						target: 'es2020',
+						jsx: {
+							// Compiles to `react/jsx-runtime` imports, which remaps to `valenced.react.ReactJSXRuntime`.
+							runtime: 'automatic',
+							// We don't expose jsxDev
+							development: false,
+						},
+						define: {
+							__DEV__: String(dev),
+							IS_DEV: String(dev),
+						},
+					},
+					onwarn(warning, warn) {
+						if (warning.code === 'MISSING_NAME_OPTION_FOR_IIFE_EXPORT') return
+						if (warning.code === 'MIXED_EXPORTS') return
+						// Plugins set `jsx: "preserve"` so TSC only typechecks and the bundler transforms.
+						// Setting it here (rather than inheriting tsconfig) keeps outputs deterministic, so the "overridden" notice is expected.
+						if (
+							warning.code === 'CONFIGURATION_FIELD_CONFLICT' &&
+							warning.message.includes('jsx')
+						)
+							return
 
-			const { output } = await bundle.generate({
-				format: 'iife',
-				globals: id => {
-					const target = resolveExternal(id)
-					if (!target)
-						throw new Error(`${id} holds types only and has no global.`)
+						warn(warning)
+					},
+				})
 
-					return target.global
-				},
-				exports: 'named',
-				esModule: false,
-				minify: dev ? 'dce-only' : true,
-			})
-			await bundle.close()
+				const { output } = await bundle.generate({
+					format: 'iife',
+					globals: id => {
+						const target = resolveExternal(id, phoenix)
+						if (!target)
+							throw new Error(`${id} holds types only and has no global.`)
 
-			const chunk = output[0]!
-			if (!chunk.exports.length)
-				throw new Error(
-					`${entry} has no default export. A plugin must have an entrypoint:\n` +
-						'`export default plugin({ ... })`.',
-				)
+						return target.global
+					},
+					exports: 'named',
+					esModule: false,
+					minify: dev ? 'dce-only' : true,
+				})
+				await bundle.close()
 
-			const outDir = `${dir}/build/js`
-			await mkdir(outDir, { recursive: true })
-			const outCode = cleanupBundleCode(chunk.code)
-			await writeFile(`${outDir}/index.js`, outCode, 'utf8')
+				const chunk = output[0]!
+				if (!chunk.exports.length)
+					throw new Error(
+						`${entry} has no default export. A plugin must have an entrypoint:\n` +
+							'`export default plugin({ ... })`.',
+					)
 
-			console.log(`\u2713 Built JS for ${manifest.id ?? name}`)
-		} catch (e) {
-			console.error(`\u2717 Failed to build JS for ${name}:`, e)
-			process.exitCode = 1
+				const outDir = `${dir}/build/${phoenix ? 'phoenix' : 'js'}`
+				await mkdir(outDir, { recursive: true })
+				const outCode = cleanupBundleCode(chunk.code)
+				await writeFile(`${outDir}/index.js`, outCode, 'utf8')
+
+				console.log(`\u2713 Built ${kind} for ${manifest.id ?? name}`)
+			} catch (e) {
+				console.error(`\u2717 Failed to build ${kind} for ${name}:`, e)
+				process.exitCode = 1
+			}
 		}
 	}
 }

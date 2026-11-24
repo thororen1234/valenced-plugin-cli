@@ -1,9 +1,15 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { rolldown } from 'rolldown'
-import { fileParserPlugin, inlineExternalImports } from '../src/build.ts'
+import { fileParserPlugin, inlineExternalImports, run } from '../src/build.ts'
 
 /** Emits the rewritten module, or the input when nothing was rewritten. */
 function transform(code: string): string {
@@ -189,5 +195,111 @@ describe('CLI Build File Parser', () => {
 		})
 		const { output } = await bundle.generate({ format: 'esm' })
 		expect(output[0].code).toContain('"a.b"')
+	})
+})
+
+describe('CLI Build Phoenix', () => {
+	test('maps @valenced/phoenix modules to valenced.phoenix', () => {
+		const output = inlineExternalImports(
+			"import { on } from '@valenced/phoenix/gateway'\nimport { onOps } from '@valenced/phoenix'\nimport { splitDispatch } from '@valenced/phoenix/ui'\nimport { ByteReader } from '@valenced/phoenix/bytes'\nexport default [on, onOps, splitDispatch, ByteReader]\n",
+			'/plugin/phoenix.ts',
+			true,
+		)
+		expect(output?.trim()).toBe(
+			'export default [valenced.phoenix.on, valenced.phoenix.onOps, valenced.phoenix.ui.splitDispatch, valenced.phoenix.bytes.ByteReader]',
+		)
+	})
+
+	test('rejects React Native modules in a Phoenix bundle', () => {
+		expect(() =>
+			inlineExternalImports(
+				"import { useState } from 'react'\nuseState()\n",
+				'/plugin/phoenix.ts',
+				true,
+			),
+		).toThrow(/react is not available in Phoenix/)
+
+		expect(() =>
+			inlineExternalImports(
+				"import { Design } from '@valenced/discord/design'\nDesign()\n",
+				'/plugin/phoenix.ts',
+				true,
+			),
+		).toThrow(/not available in Phoenix/)
+	})
+
+	test('rejects @valenced/phoenix outside a Phoenix bundle', () => {
+		expect(() =>
+			transform("import { on } from '@valenced/phoenix/gateway'\non()\n"),
+		).toThrow(/only available in a Phoenix bundle/)
+	})
+
+	test('builds phoenix.ts into build/phoenix/index.js', async () => {
+		const root = mkdtempSync(join(tmpdir(), 'valenced-cli-phoenix-'))
+		const plugin = (
+			name: string,
+			dist: Record<string, string>,
+			files: Record<string, string>,
+		) => {
+			mkdirSync(join(root, name, 'js'), { recursive: true })
+			writeFileSync(
+				join(root, name, 'manifest.json'),
+				JSON.stringify({ id: `a.${name}`, dist }),
+			)
+			for (const [file, code] of Object.entries(files))
+				writeFileSync(join(root, name, file), code)
+		}
+
+		plugin(
+			'both',
+			{ script: 'index.js', phoenix: 'phoenix.js' },
+			{
+				'js/index.ts': 'export default plugin({ start() {} })\n',
+				'js/phoenix.ts':
+					"import { on } from '@valenced/phoenix/gateway'\nexport default plugin({ start() { on('MESSAGE_CREATE', () => {}) } })\n",
+			},
+		)
+		plugin(
+			'rn-only',
+			{ script: 'index.js' },
+			{
+				'js/index.ts': 'export default plugin({})\n',
+				'js/phoenix.ts': 'export default plugin({})\n',
+			},
+		)
+		plugin(
+			'prebuilt',
+			{ phoenix: 'phoenix.js' },
+			{ 'phoenix.js': '({ default: plugin({}) })\n' },
+		)
+
+		await run(['--plugins-dir', root])
+
+		expect(process.exitCode).toBeFalsy()
+		expect(existsSync(join(root, 'both', 'build', 'js', 'index.js'))).toBe(true)
+		expect(
+			readFileSync(join(root, 'both', 'build', 'phoenix', 'index.js'), 'utf8'),
+		).toContain('valenced.phoenix.on(')
+		expect(existsSync(join(root, 'rn-only', 'build', 'phoenix'))).toBe(false)
+		expect(existsSync(join(root, 'prebuilt', 'build'))).toBe(false)
+	})
+
+	test('fails a Phoenix build that imports React', async () => {
+		const root = mkdtempSync(join(tmpdir(), 'valenced-cli-phoenix-'))
+		mkdirSync(join(root, 'p'))
+		writeFileSync(
+			join(root, 'p', 'manifest.json'),
+			JSON.stringify({ id: 'a.p', dist: { phoenix: 'phoenix.js' } }),
+		)
+		writeFileSync(
+			join(root, 'p', 'phoenix.ts'),
+			"import { useState } from 'react'\nexport default plugin({ start() { useState() } })\n",
+		)
+
+		await run(['--plugins-dir', root])
+
+		expect(process.exitCode).toBe(1)
+		expect(existsSync(join(root, 'p', 'build'))).toBe(false)
+		process.exitCode = 0
 	})
 })
